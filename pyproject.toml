@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "indoor-cycling-coach"
+version = "0.1.0"
+description = "Local indoor cycling analysis and proposal tools for AI agents"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.10,<2"]
+
+[project.scripts]
+indoor-coach = "indoor_coach.cli:main"
+indoor-coach-writer = "indoor_coach.writer:main"
+indoor-coach-mcp = "indoor_coach.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["indoor_coach*"]
