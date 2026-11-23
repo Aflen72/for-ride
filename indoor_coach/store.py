@@ -66,7 +66,20 @@ class Store:
         CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL CHECK(status='proposed'));
         CREATE TABLE IF NOT EXISTS wellness_sources(day TEXT NOT NULL, source TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(day,source));
         CREATE TABLE IF NOT EXISTS sync_attempts(id INTEGER PRIMARY KEY, oldest TEXT, newest TEXT, attempted_at TEXT, status TEXT);
-        PRAGMA user_version=3;''')
+        CREATE TABLE IF NOT EXISTS icu_indoor_ftp(account TEXT PRIMARY KEY, watts REAL, observed_at TEXT, observed_day TEXT, status TEXT NOT NULL);
+        PRAGMA user_version=4;''')
+    def remember_indoor_ftp(self, account, watts, observed_at, observed_day, status):
+        with self.db:
+            self.db.execute('''INSERT INTO icu_indoor_ftp VALUES(?,?,?,?,?)
+                ON CONFLICT(account) DO UPDATE SET watts=excluded.watts, observed_at=excluded.observed_at,
+                observed_day=excluded.observed_day, status=excluded.status''',
+                (account,watts,observed_at,observed_day,status))
+    def mark_indoor_ftp_refresh_failed(self, account):
+        with self.db:
+            self.db.execute('UPDATE icu_indoor_ftp SET status=? WHERE account=?',('refresh_failed',account))
+    def indoor_ftp(self, account):
+        row=self.db.execute('SELECT watts,observed_at,observed_day,status FROM icu_indoor_ftp WHERE account=?',(account,)).fetchone()
+        return dict(zip(('watts','observed_at','observed_day','status'),row)) if row else None
     def log_sync(self, oldest, newest, status):
         from datetime import timezone
         with self.db:
@@ -139,3 +152,17 @@ class Store:
     def proposals(self):
         return [{'id':r[0],'plan':json.loads(r[1]),'status':r[2]} for r in self.db.execute('SELECT id,payload,status FROM proposals ORDER BY rowid')]
     def close(self): self.db.close()
+
+    def get_proposal(self, proposal_id):
+        if not isinstance(proposal_id,str) or not proposal_id or len(proposal_id)>200: raise ValueError('invalid proposal_id')
+        row=self.db.execute('SELECT id,payload,status FROM proposals WHERE id=?',(proposal_id,)).fetchone()
+        return {'id':row[0],'plan':json.loads(row[1]),'status':row[2]} if row else None
+    def proposal_page(self, limit=20, after=0):
+        # Keyset cursor bounds rows decoded and avoids OFFSET work on large tables.
+        if type(limit) is not int or not 1<=limit<=100: raise ValueError('limit must be 1..100')
+        if type(after) is not int or after<0 or after>9223372036854775807: raise ValueError('invalid after cursor')
+        rows=self.db.execute('SELECT rowid,id,payload,status FROM proposals WHERE rowid>? ORDER BY rowid LIMIT ?',(after,limit+1)).fetchall()
+        page=rows[:limit]
+        return {'items':[{'id':r[1],'plan':json.loads(r[2]),'status':r[3]} for r in page],
+                'next_cursor':page[-1][0] if len(rows)>limit else None,'has_more':len(rows)>limit,
+                'scanned':len(rows),'limit':limit}

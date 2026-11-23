@@ -67,7 +67,7 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError): evidence_context([],'2040-11-15T00:00:00')
     def test_prompt_prevents_invented_access_or_repeated_questions(self):
         self.assertIn('before asking',AGENT_WORKFLOW_PROMPT)
-        self.assertIn('does not retrieve current athlete sport settings',AGENT_WORKFLOW_PROMPT)
+        self.assertIn('does not establish historical FTP, current account HR settings, or per-second streams',AGENT_WORKFLOW_PROMPT)
         self.assertIn('Do not repeat questions',AGENT_WORKFLOW_PROMPT)
 
 if __name__=='__main__': unittest.main()

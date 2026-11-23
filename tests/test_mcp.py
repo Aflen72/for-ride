@@ -17,7 +17,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     await session.initialize()
                     tools=await session.list_tools()
                     names={t.name for t in tools.tools}
-                    self.assertEqual(len(names),9)
+                    self.assertEqual(len(names),10)
                     self.assertNotIn('apply_plan',names)
                     result=await session.call_tool('propose_plan',{'as_of':'2040-11-15','ftp':240})
                     self.assertFalse(result.isError)

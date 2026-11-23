@@ -282,3 +282,80 @@ class WriterTests(unittest.TestCase):
         with patch.object(self.client,'event',side_effect=RequestFailed()):
             self.assertEqual(self.execute(reconcile=True)[0]['status'],'unknown')
         self.assertEqual(self.client.posts,1)
+
+    def test_post_success_readback_http_failure_retains_identity(self):
+        for status in (401, 403, 429, 500):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as td:
+                self.path=Path(td)/'journal'; self.client=Fake()
+                with patch.object(self.client,'event',side_effect=RequestFailed(status)):
+                    self.assertEqual(self.execute()[0]['status'],'unknown')
+                key=self.export['payload']['courses'][0]['event']['external_id']
+                with Journal(self.path) as journal:
+                    self.assertEqual(journal.row(key)[2],1)
+                    history=journal.db.execute('SELECT status FROM transitions').fetchall()
+                    self.assertNotIn(('rejected',),history)
+                self.assertEqual(self.execute(reconcile=True)[0]['status'],'verified')
+                self.assertEqual(self.client.posts,1)
+
+    def test_post_success_account_lookup_failure_retains_identity(self):
+        original=self.client.account
+        def account():
+            if self.client.posts: raise RequestFailed(403)
+            return original()
+        with patch.object(self.client,'account',side_effect=account):
+            self.assertEqual(self.execute()[0]['status'],'unknown')
+        key=self.export['payload']['courses'][0]['event']['external_id']
+        with Journal(self.path) as journal: self.assertEqual(journal.row(key)[2],1)
+        self.execute(); self.assertEqual(self.client.posts,1)
+
+    def test_cross_process_lock_release_and_crash(self):
+        import subprocess
+        import sys
+        import time
+        script = '''
+import os, sys
+from indoor_coach.writer import Journal
+try:
+    with Journal(sys.argv[1]) as j:
+        j.set('synthetic', 'binding', 'submitting')
+        if sys.argv[2] == 'crash': os._exit(23)
+except ValueError:
+    sys.exit(17)
+'''
+        command=[sys.executable,'-c',script,str(self.path)]
+        with Journal(self.path):
+            start=time.monotonic()
+            result=subprocess.run(command+['normal'],timeout=10,capture_output=True)
+            self.assertEqual(result.returncode,17,result.stderr)
+            self.assertLess(time.monotonic()-start,5)
+        self.assertEqual(subprocess.run(command+['normal'],timeout=10,capture_output=True).returncode,0)
+        self.assertEqual(subprocess.run(command+['crash'],timeout=10,capture_output=True).returncode,23)
+        with Journal(self.path) as journal:
+            self.assertEqual(journal.row('synthetic')[1],'submitting')
+
+    def test_windows_timezone_database_available(self):
+        from zoneinfo import ZoneInfo
+        self.assertEqual(ZoneInfo('Asia/Shanghai').key,'Asia/Shanghai')
+
+    def test_transport_shared_user_agent_and_safe_error_fields(self):
+        from indoor_coach.icu import USER_AGENT
+        client=WriterClient('synthetic-secret')
+        err=urllib.error.HTTPError('https://example.invalid/private',403,'private',{},io.BytesIO(b'Error code: 1010 private-body'))
+        with patch.object(client._opener,'open',side_effect=err) as op:
+            with self.assertRaises(RequestFailed) as caught: client.create({})
+        self.assertEqual(op.call_args.args[0].get_header('User-agent'),USER_AGENT)
+        self.assertEqual(caught.exception.as_dict(),{'http_status':403,'stage':'create','endpoint':'events_bulk','reason':'edge_1010','edge_code':1010})
+        self.assertNotIn('private',json.dumps(caught.exception.as_dict()))
+
+    def test_cli_preview_explicit_utf8(self):
+        from indoor_coach.writer import main
+        path=Path(self.tmp.name)/'课程.json'
+        path.write_text(json.dumps(self.export,ensure_ascii=False),encoding='utf-8')
+        original=Path.read_text
+        calls=[]
+        def read(path,*args,**kwargs):
+            calls.append(kwargs.get('encoding'))
+            return original(path,*args,**kwargs)
+        with patch('sys.argv',['writer',str(path)]),patch('sys.stdin.isatty',return_value=True),patch('sys.stdout.isatty',return_value=True),patch.object(Path,'read_text',read),patch('indoor_coach.writer.getpass.getpass',side_effect=KeyboardInterrupt),patch('builtins.print'):
+            self.assertEqual(main(),2)
+        self.assertEqual(calls,['utf-8'])

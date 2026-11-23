@@ -1,7 +1,6 @@
 """User-only writer. Never import into Service/MCP. Not a same-OS security boundary."""
 import argparse
 import datetime as dt
-import fcntl
 import getpass
 import json
 import os
@@ -9,37 +8,32 @@ from pathlib import Path
 import secrets
 import sqlite3
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from .icu import ICUClient, ICUError
 from .workout_export import canonical, digest, validate_export
 
 
 class RequestFailed(ICUError):
-    def __init__(self, status=None):
-        self.status = status
-        super().__init__('ICU request failed' + (f' (HTTP {status})' if status else '; outcome may be unknown'))
+    """Compatibility error retaining only the shared connector's safe fields."""
+    def __init__(self, status=None, *, stage='request', endpoint='unknown',
+                 reason='request_failed', edge_code=None):
+        super().__init__('ICU request failed' + (f' (HTTP {status})' if status else '; outcome may be unknown'),
+                         status=status, stage=stage, endpoint=endpoint,
+                         reason=reason, edge_code=edge_code)
 
 
 class WriterClient(ICUClient):
     """Fixed HTTPS host, no redirects/retries, credentials provided only by user CLI."""
     def request(self, method, suffix='', payload=None):
-        req = urllib.request.Request(self.BASE_URL + '/athlete/0' + suffix,
-            data=canonical(payload).encode() if payload is not None else None,
-            headers={'Authorization': self._authorization, 'Accept': 'application/json', 'Content-Type': 'application/json'}, method=method)
         try:
-            with self._opener.open(req, timeout=self.timeout) as response:
-                raw = response.read(self.MAX_RESPONSE_BYTES + 1)
-            if len(raw) > self.MAX_RESPONSE_BYTES: raise ValueError()
-            return json.loads(raw)
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            exc.close()
-            raise RequestFailed(status) from None
-        except Exception:
-            raise RequestFailed() from None
+            return self._request_json(method, suffix, payload,
+                stage='create' if method == 'POST' else 'readback' if suffix else 'account',
+                endpoint='events_bulk' if method == 'POST' else 'events' if suffix.startswith('/events?') else 'event' if suffix else 'athlete',
+                athlete_id='0')
+        except ICUError as exc:
+            raise RequestFailed(exc.status, stage=exc.stage, endpoint=exc.endpoint,
+                                reason=exc.reason, edge_code=exc.edge_code) from None
 
     def account(self):
         data = self.request('GET')
@@ -63,14 +57,30 @@ class WriterClient(ICUClient):
         return self.request('POST', '/events/bulk?upsert=false&upsertOnUid=false&updatePlanApplied=false', [event])
 
 
+def _lock_file(stream):
+    """Nonblocking OS lock. The kernel releases it on normal close or process exit."""
+    if os.name == 'nt':
+        import msvcrt
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 class Journal:
     """One durable journal per isolated writer account/home; fail closed on lock contention."""
     def __init__(self, path): self.path = Path(path)
     def __enter__(self):
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.lock = open(str(self.path) + '.lock', 'a')
+        self.lock = open(str(self.path) + '.lock', 'a+b')
+        # Windows byte-range locks need a real byte; never truncate a live lock file.
+        if self.lock.seek(0, os.SEEK_END) == 0:
+            self.lock.write(b'\0')
+            self.lock.flush()
+        self.db = None
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_file(self.lock)
             self.db = sqlite3.connect(self.path)
             os.chmod(self.path, 0o600)
             self.db.execute('PRAGMA synchronous=FULL')
@@ -78,6 +88,8 @@ class Journal:
             self.db.execute('CREATE TABLE IF NOT EXISTS transitions (at TEXT, external_id TEXT, status TEXT)')
             self.db.commit()
         except Exception:
+            if self.db is not None:
+                self.db.close()
             self.lock.close()
             raise ValueError('writer locked or journal unavailable') from None
         return self
@@ -191,20 +203,28 @@ def run(export, client, journal, terminal, reconcile_only=False):
             journal.set(key,bound,'submitting')  # commit BEFORE network side effect
             try:
                 response = client.create(c['event'])
+            except RequestFailed as exc:
+                # Only a POST rejection can be called rejected. A GET failure after
+                # successful creation says nothing about whether creation succeeded.
+                journal.set(key,bound,'rejected' if exc.status in (401,403,429) else 'unknown')
+                if exc.status not in (401,403,429): reconcile(client,journal,b,c)
+            except Exception:
+                journal.set(key,bound,'unknown')
+            else:
                 if (not isinstance(response,list) or len(response)!=1 or not isinstance(response[0],dict)
                         or type(response[0].get('id')) is not int or response[0]['id'] <= 0):
                     journal.set(key,bound,'unknown')
                     break
                 ident = response[0]['id']
+                # Persist identity before any verification network call. This row
+                # forbids re-POST even if verification fails or the process crashes.
                 journal.set(key,bound,'submitted',ident)
-                remote = client.event(ident)
-                check_account(client,b)
-                journal.set(key,bound,'verified' if verify(remote,b,c) else 'verification_failed',ident)
-            except RequestFailed as exc:
-                journal.set(key,bound,'rejected' if exc.status in (401,403,429) else 'unknown')
-                if exc.status not in (401,403,429): reconcile(client,journal,b,c)
-            except Exception:
-                journal.set(key,bound,'unknown')
+                try:
+                    remote = client.event(ident)
+                    check_account(client,b)
+                    journal.set(key,bound,'verified' if verify(remote,b,c) else 'verification_failed',ident)
+                except Exception:
+                    journal.set(key,bound,'unknown',ident)
             if journal.row(key)[1] != 'verified': break
     return [{'external_id':c['event']['external_id'], 'status':(journal.row(c['event']['external_id']) or (None,'not_submitted',None))[1]} for c in b['courses']]
 
@@ -216,7 +236,7 @@ def main():
     args = parser.parse_args()
     try:
         if not sys.stdin.isatty() or not sys.stdout.isatty(): raise ValueError('TTY required')
-        export = json.loads(args.preview.read_text())
+        export = json.loads(args.preview.read_text(encoding='utf-8'))
         validate_export(export, allow_expired=args.reconcile_only)
         # No environment fallback: read credentials only in the independent user process.
         key = getpass.getpass('Intervals API key (user-only process): ')

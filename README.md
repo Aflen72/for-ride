@@ -56,15 +56,16 @@ py -3 -m venv .venv
 
 | 工具 | 参数 | 副作用 |
 |---|---|---|
-| prepare_analysis | as_of、可选 ftp / target_id / history_days / refresh | 默认尝试一次授权 ICU 读取并写缓存；只输出有据分析 |
+| prepare_analysis | as_of、可选 ftp / target_id / history_days / refresh / detail | 默认读取授权 ICU 数据并写缓存；未传 FTP 时另检查当前室内设置 |
 | import_activities | records 数组 | 写本地数据库 |
 | import_wellness | records 数组 | 写本地数据库 |
 | import_baseline | record 对象 | 写本地数据库 |
 | sync_icu | oldest, newest：YYYY-MM-DD | 读取 ICU，写本地数据库 |
-| analyze | as_of, 可选 ftp | 无 |
-| propose_plan | as_of, 可选 ftp | 保存本地草案并回读校验 |
-| list_proposals | 空对象 | 无 |
-| preview_icu | proposal_id、account、timezone、ftp、可选 selection | 只读最小课程导出，不批准、不写远端 |
+| analyze | as_of，可选 ftp / detail | 无 |
+| propose_plan | as_of，可选 ftp / detail | 保存本地草案并回读校验 |
+| list_proposals | 可选 limit / after / detail | 无；无参保留旧列表 |
+| get_proposal | proposal_id，可选 detail | 按 ID 读取单份草案 |
+| preview_icu | proposal_id、account、timezone、可选 ftp / selection | 只读最小课程导出，不批准、不写远端 |
 
 ### MCP 接入其他 AI / agent
 
@@ -79,7 +80,7 @@ python -m indoor_coach.mcp_server
 {"mcpServers":{"indoor-coach":{"command":"/absolute/path/to/python","args":["-m","indoor_coach.mcp_server"],"env":{"INDOOR_COACH_DB":"/absolute/path/to/coach.sqlite3"}}}}
 ```
 
-使用安装了本项目和 MCP SDK 的 Python；Windows 可指向虚拟环境的 `Scripts/python.exe`。MCP 与 JSONL 暴露相同九个工具，无外部写入工具。已通过真实子进程 MCP 握手、工具发现、提案与回读测试。SDK 可能向 stderr 输出非致命依赖警告，stdout 保持协议格式。
+使用安装了本项目和 MCP SDK 的 Python；Windows 可指向虚拟环境的 `Scripts/python.exe`。MCP 与 JSONL 暴露相同十个工具，无外部写入工具。已通过真实子进程 MCP 握手、工具发现、提案与回读测试。需要短响应时，在分析、提案和详情请求中传入 `detail: "summary"`；默认 `full` 保留旧字段格式。列表大时使用 `limit`（1–100）和上一页的 `next_cursor` 作为 `after`；传分页参数才返回分页对象。通过 `get_proposal` 读单条完整草案，无需列表全量回传。SDK 可能向 stderr 输出非致命依赖警告，stdout 保持协议格式。
 
 ### 数据格式与缺失
 
@@ -95,7 +96,7 @@ python -m indoor_coach.mcp_server
 
 重复手动录入按字段更新，省略字段保留已有手动值；显式 null 清除该字段的手动优先值，允许回落到 ICU 来源。清除 HRV 数值时整组回落。来源快照是每个来源的最新状态，并非不可篡改审计历史。旧版无来源记录保守迁移为手动数据。
 
-FTP 参数是用户提供的当前室内 FTP，不从单次低心率或运动自动上调。历史活动的 TSS 也是按该当前 FTP 估算，明确不是活动当时 FTP 下的原始 TSS；不能当作平台历史负荷事实。没有 FTP 时只输出适合缺失数据的非精确建议。
+显式 `ftp` 优先，含义是用户提供的室内 FTP。未提供时，`prepare_analysis(refresh=true)` 可用授权身份读取当前 Ride 的 `indoor_ftp`；普通 Ride FTP 或活动历史 FTP 不是替代值。不从单次低心率或运动自动上调。活动 TSS 仍只是按适用于报告的 FTP 估算，不是活动当时的原始 TSS。FTP 不可用时不给固定瓦数。
 
 ## Intervals.icu 只读接入
 
@@ -105,7 +106,13 @@ FTP 参数是用户提供的当前室内 FTP，不从单次低心率或运动自
 {"id":7,"tool":"sync_icu","arguments":{"oldest":"2040-11-08","newest":"2040-11-15"}}
 ```
 
-固定官方 HTTPS 域名，只读 activities/wellness，不支持任意 URL，不跟随重定向。Strava 来源活动可能因第三方限制仅有元数据，本版保留限制标记和缺失项，不尝试绕过，不能据此断言没有训练或恢复良好。
+固定官方 HTTPS 域名，读取 activities/wellness，以及未传 FTP 的授权分析所需账户身份与 Ride 设置，不支持任意 URL，不跟随重定向。读取和独立 writer 使用真实的 `for-ride` User-Agent，不伪装浏览器。错误返回可用的 HTTP 状态与阶段；仅当响应明确提及边缘错误 1010 时标记，不输出响应正文、密钥或原始请求，不自动重试。真实 403/1010 若持续出现，请按 ICU 平台支持流程排查。Strava 来源活动可能因第三方限制仅有元数据，本版保留限制标记和缺失项，不尝试绕过，不能据此断言没有训练或恢复良好。
+
+### 室内 FTP 来源与离线边界
+
+`ftp_basis` 会注明显式传入、ICU 当前值或缓存、账户、观测时间/当地日及可用状态。`prepare_analysis` 可在未提供手动 FTP 时读取官方 `/athlete/{id}` 和 `/athlete/{id}/sport-settings/Ride`；身份响应只保留 ID 与时区，其他字段不入库。当前 FTP 不用于早于设置观测日的历史分析。缓存仅以同一具体账户为范围，最多 24 小时；刷新失败、过期、室内 FTP 未设或无效时不把缓存旧值用于固定瓦数。默认账户别名 `0` 仅在同一进程确认身份后能复用对应缓存；重启后离线读取需本地配置同一具体 `INTERVALS_ATHLETE_ID`。换用户使用独立数据库。本版不更改 ICU 的 FTP 或设置。
+
+新草案固定绑定 FTP 与账户（如果来自 ICU 设置）；预览无法通过另传一个接近值而改写瓦数，同一草案的绑定值过期需重新刷新和出草案。用户显式提供 FTP 仍可离线使用。
 
 ### 来源判定与旧记录修复
 
@@ -127,8 +134,8 @@ FTP 参数是用户提供的当前室内 FTP，不从单次低心率或运动自
 {"id":"review-1","tool":"prepare_analysis","arguments":{"as_of":"2040-11-15","target_id":"your-activity-id","history_days":28,"ftp":240,"refresh":true}}
 ```
 
-1. 默认检查本机 ICU 凭据。已配置时只请求一次所选窗口的 activities 和 wellness；未配置/失败会留下查询状态并继续用本地记录，不循环追问或冒称已核验最新。`refresh=false` 只查看缓存。
-2. 先检查用户自己的活动心率分区与分区时间。连接器映射 `icu_hr_zones` / `icu_hr_zone_times`，字段缺失就明确缺失。**这只是活动保存的配置，不是当前账户运动设置；当前版本没有读取 settings 或逐秒 streams 的能力。** 如结论必须依赖它们，宿主需使用另一个确实有权限和能力的工具，或最后只问用户那项缺失证据。
+1. 默认检查本机 ICU 凭据，按所选窗口最多各尝试一次 activities 和 wellness；未传 FTP 时单独请求账户身份与 Ride 设置。未配置/失败会留下查询状态并继续用本地记录，不循环追问或冒称已核验最新。`refresh=false`、`analyze` 和 `propose_plan` 均不联网。
+2. 先检查用户自己的活动心率分区与分区时间。连接器映射 `icu_hr_zones` / `icu_hr_zone_times`，字段缺失就明确缺失。**这只是活动保存的配置，不是当前账户运动设置；当前版本不提供当前账户心率设置或逐秒 streams。** 如结论必须依赖它们，宿主需使用另一个确实有权限和能力的工具，或最后只问用户那项缺失证据。
 3. 以明确时间窗检索此前同类骑行台记录：默认28日（可选7–90日），早于目标活动日期、时长±25%、平均功率±15%。这只是筛选对照，不是训练效果的因果证明。明确 `target_id` 不存在时不会悄悄换成另一条；省略时取最新日期，同行程同日以ID作确定性排序，不假装知道先后时间。
 4. 输出观察事实、计算值与暂定解释的边界：活动ID、日期、来源、窗口、对照筛选、分区依据、缺失项和下一步。平均心率落入某区不证明整堂课的区间时间，也不证明恢复、疲劳、FTP或有氧效果。不得用年龄公式补个人分区，不猜课程结束原因。
 
@@ -182,7 +189,7 @@ python -m compileall -q indoor_coach tests
 
 开发约束：个人试用的数据、样例、日志、导出、账户标识和凭据仅保留在隔离的私有环境，不得提交，也不得通过改标签冒充合成样例。自动化测试必须独立构造，与个人记录无关。提交前检查暂存文件及拟公开历史对象。
 
-测试全用合成数据与模拟网络，**不会调用真人 ICU 账号**。未安装 MCP SDK 时 MCP 集成测试会明确跳过，不能据此宣称完整通过。GitHub Actions 在 Python 3.10 / 3.12 上运行同一套检查；详见 [验证记录](VALIDATION.md)。
+测试全用合成数据与模拟网络，**不会调用真人 ICU 账号**。未安装 MCP SDK 时 MCP 集成测试会明确跳过，不能据此宣称完整通过。GitHub Actions 配置了 Ubuntu / Windows 上 Python 3.10 / 3.12 的检查；详见 [验证记录](VALIDATION.md)。
 
 ```text
 indoor_coach/    分析、SQLite、ICU 只读适配器、独立用户 writer、JSONL 与 MCP 服务
@@ -198,15 +205,15 @@ tests/          单元及真实 MCP stdio 集成测试
 
 ## ICU 课程导出与独立用户写入（首版）
 
-`preview_icu` 参数：`proposal_id`（已有草案ID）、`account`（具体 ICU 账户ID，不能为0）、`timezone`（与账户一致的 IANA 时区）、`ftp`（与草案一致）、`selection`（`next` 或 `week`）。调用不联网、不持有 writer 凭据、不批准。将 JSONL 返回的 **result 对象** 或 MCP 返回的导出对象保存为 `preview.json`，交给用户环境；不要连同 JSONL 的 id/result 外壳保存。休息日不上传，next 是草案第一天，第一天休息时拒绝空导出。草案缺 FTP 或功率与 FTP 不符时需重新生成。
+`preview_icu` 参数：`proposal_id`（已有草案ID）、`account`（具体 ICU 账户ID，不能为0）、`timezone`（与账户一致的 IANA 时区）、`ftp`（新草案可省略，手动传值须与绑定值完全一致；旧草案仍需显式指定）、`selection`（`next` 或 `week`）。调用不联网、不持有 writer 凭据、不批准。将 JSONL 返回的 **result 对象** 或 MCP 返回的导出对象保存为 `preview.json`，交给用户环境；不要连同 JSONL 的 id/result 外壳保存。休息日不上传，next 是草案第一天，第一天休息时拒绝空导出。草案缺 FTP 或功率与 FTP 不符时需重新生成。
 
 ```json
 {"tool":"preview_icu","arguments":{"proposal_id":"<草案ID>","account":"<实际账户ID>","timezone":"Asia/Shanghai","ftp":200,"selection":"week"}}
 ```
 
-导出只包含账户、日期/时区、固定瓦数/秒数、总时长、FTP 依据、create 动作、冲突策略、不可变提案ID、24小时有效期及 SHA256。原草案范围转换成 FTP 区间中点并取整到瓦，属于需要重新审阅的具体课程，不能暗中沿用旧批准。每步不再依赖 ICU 当前 FTP；远端 `icu_ftp` 可能不同，不应当作固定瓦数的转换依据。睡眠、HRV、疲劳、活动历史与建议理由不会上传。哈希只能检测内容变化，不能证明作者或用户身份。
+导出只包含账户、日期/时区、固定瓦数/秒数、总时长、FTP 依据、create 动作、冲突策略、不可变提案ID、最多 24 小时有效期（不超过 ICU FTP 缓存截止时间）及 SHA256。原草案范围转换成 FTP 区间中点并取整到瓦，属于需要重新审阅的具体课程，不能暗中沿用旧批准。每步不再依赖 ICU 当前 FTP；远端 `icu_ftp` 可能不同，不应当作固定瓦数的转换依据。睡眠、HRV、疲劳、活动历史与建议理由不会上传。哈希只能检测内容变化，不能证明作者或用户身份。
 
-以下命令**只允许真人在 agent 无法访问的独立用户环境运行**（当前 writer 支持 Linux/macOS POSIX 锁；Windows agent 工具不受影响，writer 暂不支持原生 Windows）：
+以下命令**只允许真人在 agent 无法访问的独立用户环境运行**（Linux/macOS 用 POSIX 锁，Windows 用非阻塞文件锁及 `tzdata`；本次尚未在 Windows 实机或真实 ICU 账号验证）：
 
 ```sh
 python -m indoor_coach.writer preview.json
@@ -221,7 +228,7 @@ CLI 用隐藏输入获取个人 API key（Basic 用户名 `API_KEY`），不会�
 
 写入只用 `POST /api/v1/athlete/0/events/bulk?upsert=false&upsertOnUid=false&updatePlanApplied=false`，每请求一课，category=WORKOUT/type=Ride，本地日期 T00:00:00 和原生 `- 600s 110w` 文本，不发送私有 `icu_workout` 字段。external_id 来自应用命名空间、具体账户、不可变提案ID与课序号，不以日期作为唯一标识。任何日历项目都导致默认停止，包括备注/其他安排和同 external_id 的已有课程，不更新或删除。首次预检全周，逐课 POST 前再查；用户已编辑的课不会被覆盖。
 
-持久日志位于独立用户的 `~/.indoor-coach-writer/executions.sqlite3`，全流程单机文件锁；不要删除日志、更换 writer home 或在另一机器并行运行。每课 POST 前提交 `submitting`；异常/5xx 为 `unknown`，401/403/429 为 `rejected`，不存在自动重试。后续运行对曾尝试课程只回读协调；没有找到不代表没有创建，unknown 禁止重发。尚有未解决课程时也停止后续新课；周计划不会整批重做。已 verified 的课不重传，重新生成相同课程导出不会重传。verified 仅代表上次核验结果；每次再次运行（包括 `--reconcile-only`）都会重新 GET 核对。远端修改为 `verification_failed`，日期列表中消失或读取失败为 `unknown`（不据此断言已删除），都不会重发。更改已尝试课程的绑定直接拒绝，需要人工调查。崩溃、缺ID或读失败保留不确定状态；`--reconcile-only` 永不 POST。
+持久日志位于独立用户的 `~/.indoor-coach-writer/executions.sqlite3`，全流程单机文件锁；不要删除日志、更换 writer home 或在另一机器并行运行。每课 POST 前提交 `submitting`；异常/5xx 为 `unknown`，创建请求明确返回 401/403/429 为 `rejected`；如果 POST 已返回新事件 ID，随后读取 401/403/429 仍为 `unknown`，保留 ID，只允许再读核验，不存在自动重试。后续运行对曾尝试课程只回读协调；没有找到不代表没有创建，unknown 禁止重发。尚有未解决课程时也停止后续新课；周计划不会整批重做。已 verified 的课不重传，重新生成相同课程导出不会重传。verified 仅代表上次核验结果；每次再次运行（包括 `--reconcile-only`）都会重新 GET 核对。远端修改为 `verification_failed`，日期列表中消失或读取失败为 `unknown`（不据此断言已删除），都不会重发。更改已尝试课程的绑定直接拒绝，需要人工调查。崩溃、缺ID或读失败保留不确定状态；`--reconcile-only` 永不 POST。
 
 独立 GET 单课核验账户、日期、type/category、external_id、原生文本、平台 moving_time/joules，以及 `workout_doc` 的顺序、每段 duration、固定 w 功率和总 duration。只支持平坦定时恒功率结构；缺字段、未知结构、百分比、重复/渐变、舍入差异均 `verification_failed`。这不验证 Garmin 等下游设备接收，也不修改用户 FTP。200 或返回ID不代表验证成功。readback失败不会回滚、修改或重传；请在 ICU 手工检查。
 

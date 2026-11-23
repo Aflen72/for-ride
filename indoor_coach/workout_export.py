@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from zoneinfo import ZoneInfo
+from .ftp import concrete_account
 
 
 def canonical(value):
@@ -30,6 +31,23 @@ def preview(proposal, account, timezone, ftp, selection='next', now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     if selection not in ('next', 'week'): raise ValueError('invalid selection')
     plan = proposal['plan']
+    expires_at = now + dt.timedelta(hours=24)
+    basis = plan.get('ftp_basis')
+    if basis is not None:
+        saved_ftp = basis['watts']
+        if saved_ftp is None or basis['status'] != 'available':
+            raise ValueError('no trusted FTP is bound to this draft; regenerate')
+        if ftp is not None and (type(ftp) not in (int, float) or ftp != saved_ftp):
+            raise ValueError('FTP differs from proposal; regenerate')
+        ftp = saved_ftp
+        if basis.get('account') is not None:
+            if concrete_account(account) != basis['account']:
+                raise ValueError('account differs from FTP basis; regenerate')
+            expires_at = min(expires_at, dt.datetime.fromisoformat(basis['valid_until']))
+            if expires_at <= now:
+                raise ValueError('FTP basis expired; refresh settings and regenerate')
+    elif type(ftp) not in (int, float) or not 30 <= ftp <= 700:
+        raise ValueError('legacy proposal requires explicit FTP')
     # Store's original proposal identity uses its legacy JSON serialization.
     identity = hashlib.sha256(json.dumps(plan, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
     if identity != proposal['id']: raise ValueError('proposal changed')
@@ -49,7 +67,7 @@ def preview(proposal, account, timezone, ftp, selection='next', now=None):
     body = {'version': 1, 'proposal_id': identity, 'account': account, 'timezone': timezone,
             'ftp_w': ftp, 'power_basis': 'rounded midpoint of draft FTP ranges; fixed watts',
             'action': 'create', 'conflict_policy': 'stop_on_any_calendar_item',
-            'created_at': now.isoformat(), 'expires_at': (now + dt.timedelta(hours=24)).isoformat(),
+            'created_at': now.isoformat(), 'expires_at': expires_at.isoformat(),
             'courses': courses}
     for course in courses: course['event'] = event_for(body, course['index'], course)
     result = {'payload': body, 'sha256': digest(body)}

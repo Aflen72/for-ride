@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 from .service import Service, TOOLS
+from .icu import ICUError
 
 def main():
     parser=argparse.ArgumentParser(description='Local indoor cycling agent tools (JSONL, not MCP)')
@@ -24,6 +25,8 @@ def main():
                 if request_id is not None and not isinstance(request_id,(str,int)): raise ValueError('id must be string or integer')
                 result=service.call(req['tool'],req.get('arguments',{}))
                 response={'id':request_id,'result':result}
+            except ICUError as exc:
+                response={'id':request_id,'error':exc.as_dict()}
             except (ValueError,KeyError,TypeError) as exc:
                 # Validation messages never include input payloads or credentials.
                 response={'id':request_id,'error':{'code':'invalid_request','message':'Invalid request or unsupported tool. Check documented schema.'}}

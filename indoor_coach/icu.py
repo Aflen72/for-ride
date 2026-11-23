@@ -14,8 +14,24 @@ import urllib.request
 from .provenance import canonical_source, classify_source
 
 
+USER_AGENT = "for-ride/0.1.0 (indoor cycling analysis; Python urllib)"
+
+
 class ICUError(RuntimeError):
-    """Safe-to-display connector error (never includes response body or credentials)."""
+    """Safe structured diagnostics; never attach upstream body, URL, or credentials."""
+    def __init__(self, message="Intervals.icu request failed", *, status=None,
+                 stage="request", endpoint="unknown", reason="request_failed", edge_code=None):
+        super().__init__(message)
+        self.status = status if type(status) is int and 100 <= status <= 599 else None
+        self.stage = stage if stage in {"request", "activities", "wellness", "identity", "sport_settings", "account", "events", "event", "create", "readback"} else "request"
+        self.endpoint = endpoint if endpoint in {"unknown", "athlete", "activities", "wellness", "sport_settings", "events", "event", "events_bulk"} else "unknown"
+        self.reason = reason if reason in {"request_failed", "http_error", "forbidden", "edge_1010", "transport_error", "response_too_large", "invalid_json", "unexpected_shape", "invalid_identity", "identity_mismatch", "wrong_sport", "not_configured"} else "request_failed"
+        self.edge_code = 1010 if edge_code == 1010 else None
+
+    def as_dict(self):
+        return {"http_status": self.status, "stage": self.stage,
+                "endpoint": self.endpoint, "reason": self.reason, "edge_code": self.edge_code}
+
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -148,36 +164,121 @@ class ICUClient:
     def from_env(cls):
         key = os.environ.get("INTERVALS_API_KEY")
         if not key:
-            raise ICUError("Set INTERVALS_API_KEY locally before requesting live data")
+            raise ICUError("Set INTERVALS_API_KEY locally before requesting live data", reason="not_configured")
         return cls(key, os.environ.get("INTERVALS_ATHLETE_ID", "0"))
 
-    def _get(self, endpoint: str, oldest: str, newest: str):
-        start, end = _date(oldest), _date(newest)
-        if end < start or (end - start).days > self.MAX_RANGE_DAYS:
-            raise ValueError("Date range must be ordered and no longer than 366 days")
-        # endpoint is exclusively a literal selected by the two public methods.
-        query = urllib.parse.urlencode({"oldest": oldest, "newest": newest})
-        url = f"{self.BASE_URL}/athlete/{self.athlete_id}/{endpoint}?{query}"
-        request = urllib.request.Request(url, headers={"Authorization": self._authorization, "Accept": "application/json"}, method="GET")
+    def _request_json(self, method, suffix="", payload=None, *, stage="request",
+                      endpoint="unknown", athlete_id=None):
+        """Shared reader/writer transport. No retry, redirect, UA rotation or impersonation.
+
+        Callers supply only fixed endpoint suffixes. Athlete profiles are projected by
+        identity() immediately; never log or persist this low-level raw response.
+        """
+        athlete = self.athlete_id if athlete_id is None else str(athlete_id)
+        if not re.fullmatch(r"(?:0|i?\d+)", athlete):
+            raise ValueError("Invalid athlete ID")
+        if not isinstance(suffix, str) or (suffix and not suffix.startswith(("/", "?"))) or any(c in suffix for c in "\r\n#"):
+            raise ValueError("Invalid endpoint suffix")
+        if ".." in suffix or suffix.startswith("//"):
+            raise ValueError("Invalid endpoint suffix")
+        url = f"{self.BASE_URL}/athlete/{athlete}{suffix}"
+        request = urllib.request.Request(url,
+            data=json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                            separators=(",", ":")).encode() if payload is not None else None,
+            headers={"Authorization": self._authorization, "Accept": "application/json",
+                     "Content-Type": "application/json", "User-Agent": USER_AGENT}, method=method)
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
                 data = response.read(self.MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             status = exc.code
-            exc.close()
-            raise ICUError(f"Intervals.icu HTTP {status}; check permission, credentials, or service availability") from None
+            # Only inspect a bounded prefix to distinguish an explicit edge error.
+            # Never retain or expose the response body, headers, URL or exception.
+            try:
+                body = exc.read(4096).decode("utf-8", errors="replace")
+                identified = status == 403 and bool(re.search(
+                    r"(?:error(?:\s+code)?\s*[:#]?\s*1010\b|[\"'](?:code|error_code)[\"']\s*:\s*[\"']?1010\b)", body, re.I))
+            except Exception:
+                identified = False
+            finally:
+                exc.close()
+            reason = "edge_1010" if identified else "forbidden" if status == 403 else "http_error"
+            extra = "; explicit edge error 1010" if identified else ""
+            raise ICUError(f"Intervals.icu HTTP {status}{extra}", status=status, stage=stage,
+                           endpoint=endpoint, reason=reason, edge_code=1010 if identified else None) from None
         except Exception:
-            # URL/transport errors may contain sensitive details in their repr.
-            raise ICUError("Intervals.icu request failed; check connectivity and retry manually") from None
+            raise ICUError("Intervals.icu request failed; check connectivity and retry manually",
+                           stage=stage, endpoint=endpoint, reason="transport_error") from None
         if len(data) > self.MAX_RESPONSE_BYTES:
-            raise ICUError("Intervals.icu response too large; use a smaller date range")
+            raise ICUError("Intervals.icu response too large; use a smaller date range",
+                           stage=stage, endpoint=endpoint, reason="response_too_large")
         try:
-            parsed = json.loads(data)
+            return json.loads(data)
         except (ValueError, UnicodeDecodeError):
-            raise ICUError("Intervals.icu returned invalid JSON") from None
+            raise ICUError("Intervals.icu returned invalid JSON", stage=stage,
+                           endpoint=endpoint, reason="invalid_json") from None
+
+    def _get(self, endpoint: str, oldest: str, newest: str):
+        start, end = _date(oldest), _date(newest)
+        if end < start or (end - start).days > self.MAX_RANGE_DAYS:
+            raise ValueError("Date range must be ordered and no longer than 366 days")
+        if endpoint not in ("activities", "wellness"):
+            raise ValueError("Unsupported endpoint")
+        query = urllib.parse.urlencode({"oldest": oldest, "newest": newest})
+        parsed = self._request_json("GET", f"/{endpoint}?{query}", stage=endpoint, endpoint=endpoint)
         if not isinstance(parsed, list) or any(not isinstance(row, dict) for row in parsed):
-            raise ICUError("Intervals.icu returned an unexpected data shape")
+            raise ICUError("Intervals.icu returned an unexpected data shape", stage=endpoint,
+                           endpoint=endpoint, reason="unexpected_shape")
         return parsed
+
+    def identity(self):
+        """Resolve configured account (0 means authenticated self), whitelist id/timezone.
+
+        Official OpenAPI documents no fields filter for GET athlete. We therefore
+        do not claim server-side projection: all other fields are discarded here.
+        """
+        data = self._request_json("GET", stage="identity", endpoint="athlete")
+        if not isinstance(data, dict) or not isinstance(data.get("id"), str) or not re.fullmatch(r"i?\d+", data["id"]) or int(data["id"].removeprefix("i")) == 0:
+            raise ICUError("Intervals.icu returned invalid account identity", stage="identity",
+                           endpoint="athlete", reason="invalid_identity")
+        if self.athlete_id != "0" and data["id"].removeprefix("i") != self.athlete_id.removeprefix("i"):
+            raise ICUError("Intervals.icu account identity mismatch", stage="identity",
+                           endpoint="athlete", reason="identity_mismatch")
+        timezone = data.get("timezone")
+        if not isinstance(timezone, str) or not re.fullmatch(r"[A-Za-z0-9_+./-]{1,80}", timezone):
+            timezone = None
+        return {"id": data["id"], "timezone": timezone}
+
+    def sport_settings(self):
+        """Current Ride settings only, not the settings used for historical activities.
+
+        power_zones are percentages of FTP; hr_zones are returned as API-native
+        values without guessing their unit or applying a max-HR conversion.
+        """
+        data = self._request_json("GET", "/sport-settings/Ride", stage="sport_settings", endpoint="sport_settings")
+        if not isinstance(data, dict):
+            raise ICUError("Intervals.icu returned an unexpected data shape", stage="sport_settings",
+                           endpoint="sport_settings", reason="unexpected_shape")
+        types = data.get("types")
+        if not isinstance(types, list) or not all(isinstance(t, str) for t in types) or "Ride" not in types:
+            raise ICUError("Intervals.icu returned settings for the wrong sport", stage="sport_settings",
+                           endpoint="sport_settings", reason="wrong_sport")
+        account = data.get("athlete_id")
+        if not isinstance(account, str) or not re.fullmatch(r"i?\d+", account) or int(account.removeprefix("i")) == 0 or (self.athlete_id != "0" and account.removeprefix("i") != self.athlete_id.removeprefix("i")):
+            raise ICUError("Intervals.icu settings account mismatch", stage="sport_settings",
+                           endpoint="sport_settings", reason="identity_mismatch")
+        def positive(value, maximum):
+            value = _number(value)
+            return value if value is not None and 0 < value <= maximum else None
+        return {"id": data.get("id") if type(data.get("id")) is int else None,
+                "athlete_id": account, "types": [t for t in types if len(t) < 80],
+                "ftp": positive(data.get("ftp"), 1000),
+                "indoor_ftp": positive(data.get("indoor_ftp"), 1000),
+                "indoor_ftp_status": ("unset" if data.get("indoor_ftp") is None else "valid" if positive(data.get("indoor_ftp"), 1000) is not None else "invalid"),
+                "lthr": positive(data.get("lthr"), 250),
+                "max_hr": positive(data.get("max_hr"), 250),
+                "power_zones": _zone_list(data.get("power_zones"), boundaries=True),
+                "hr_zones": _zone_list(data.get("hr_zones"), boundaries=True)}
 
     def activities(self, oldest: str, newest: str):
         return [normalize_activity(row) for row in self._get("activities", oldest, newest)]
