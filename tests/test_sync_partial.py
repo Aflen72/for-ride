@@ -37,6 +37,16 @@ class PartialSyncTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.db=str(Path(self.temp.name)/'synthetic.sqlite')
 
+    def isolated_env(self, **extra):
+        # Both entry points evaluate a default based on Path.home() even when a
+        # DB path is supplied. Windows requires USERPROFILE when env is cleared.
+        return patch.dict(os.environ, {
+            'HOME':self.temp.name,
+            'USERPROFILE':self.temp.name,
+            'INTERVALS_API_KEY':'synthetic-only',
+            **extra,
+        },clear=True)
+
     @contextmanager
     def transport(self, activities, wellness):
         def request(req,timeout):
@@ -52,7 +62,7 @@ class PartialSyncTests(unittest.TestCase):
     def cli(self,*cmds):
         buf=io.StringIO()
         stdin=io.StringIO(''.join(json.dumps(c)+'\n' for c in cmds))
-        with patch('sys.argv',['indoor-coach','--db',self.db]), patch('sys.stdin',stdin), patch('sys.stdout',buf), patch.dict(os.environ,{'INTERVALS_API_KEY':'synthetic-only'},clear=True):
+        with patch('sys.argv',['indoor-coach','--db',self.db]), patch('sys.stdin',stdin), patch('sys.stdout',buf), self.isolated_env():
             main()
         return [json.loads(row) for row in buf.getvalue().splitlines()]
 
@@ -143,7 +153,7 @@ class PartialSyncTests(unittest.TestCase):
         import importlib.util
         if not importlib.util.find_spec('mcp'): self.skipTest('optional MCP dependency absent')
         import indoor_coach.mcp_server as server
-        with self.transport([ride('i551'),None],[]), patch.dict(os.environ,{'INTERVALS_API_KEY':'synthetic-only','INDOOR_COACH_DB':self.db},clear=True), patch.object(server,'_service',None):
+        with self.transport([ride('i551'),None],[]), self.isolated_env(INDOOR_COACH_DB=self.db), patch.object(server,'_service',None):
             try:
                 output=asyncio.run(server.mcp.call_tool('prepare_analysis',{**ARGS,'detail':'summary'}))
                 text=output[0] if isinstance(output,tuple) else output
