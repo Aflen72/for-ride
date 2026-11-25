@@ -1,5 +1,5 @@
 """Public tool entry-point tests using synthetic ICU transport, never real data."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import io
 import json
 import os
@@ -96,7 +96,7 @@ class PartialSyncTests(unittest.TestCase):
             self.assertEqual(rep['data_review']['status'],'limited')
             self.assertNotIn('PRIVATE_',str(rep))
         self.assertNotIn('PRIVATE_',Path(self.db).read_bytes().decode(errors='ignore'))
-        with sqlite3.connect(self.db) as db:
+        with closing(sqlite3.connect(self.db)) as db:
             persisted=json.loads(db.execute('SELECT payload FROM sync_diagnostics').fetchone()[0])
             self.assertEqual(persisted['skipped_activity_ids'],['i512','i513'])
 
