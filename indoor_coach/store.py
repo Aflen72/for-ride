@@ -2,11 +2,12 @@
 import json
 import math
 import sqlite3
-from datetime import date, datetime
+from contextlib import nullcontext
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from .provenance import enforce_provenance
 
-ACTIVITY_FIELDS = {'id','date','sport','indoor','duration_s','avg_power_w','normalized_power_w','avg_hr_bpm','source','restricted','available_fields','withheld_reason','source_status','hr_zone_upper_bpm','hr_zone_time_s'}
+ACTIVITY_FIELDS = {'id','date','sport','indoor','duration_s','avg_power_w','normalized_power_w','avg_hr_bpm','source','restricted','available_fields','withheld_reason','source_status','hr_zone_upper_bpm','hr_zone_time_s','heart_rate_quality'}
 WELLNESS_FIELDS = {'date','sleep_hours','bedtime','hrv_ms','hrv_type','device','resting_hr_bpm','deep_sleep_pct','light_sleep_pct','fatigue'}
 BASELINE_FIELDS = WELLNESS_FIELDS - {'date','fatigue'} | {'sample_count','period_start','period_end','source'}
 
@@ -29,6 +30,8 @@ def validate(data, kind):
         if not isinstance(d.get('id'),str) or not 1<=len(d['id'])<=200: raise ValueError('activity id required')
         if d.get('indoor') not in (True,False,None) or (d.get('indoor') is not None and not isinstance(d['indoor'],bool)): raise ValueError('indoor must be boolean or null')
         if d.get('restricted') not in (True,False,None) or (d.get('restricted') is not None and not isinstance(d['restricted'],bool)): raise ValueError('restricted must be boolean or null')
+        quality=d.get('heart_rate_quality')
+        if quality not in (None,'missing_zero','invalid') or (quality is not None and d.get('avg_hr_bpm') is not None): raise ValueError('invalid average heart-rate quality')
     if d.get('source_status') not in (None,'independent','restricted','unknown'): raise ValueError('invalid source_status')
     if d.get('available_fields') is not None and (not isinstance(d['available_fields'],list) or any(x not in ACTIVITY_FIELDS for x in d['available_fields'])): raise ValueError('invalid available_fields')
     if d.get('withheld_reason') is not None and (not isinstance(d['withheld_reason'],str) or len(d['withheld_reason'])>1000): raise ValueError('invalid withheld_reason')
@@ -66,8 +69,11 @@ class Store:
         CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL CHECK(status='proposed'));
         CREATE TABLE IF NOT EXISTS wellness_sources(day TEXT NOT NULL, source TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(day,source));
         CREATE TABLE IF NOT EXISTS sync_attempts(id INTEGER PRIMARY KEY, oldest TEXT, newest TEXT, attempted_at TEXT, status TEXT);
+        CREATE TABLE IF NOT EXISTS sync_diagnostics(attempt_id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS icu_sync_day(day TEXT PRIMARY KEY, status TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS icu_rejected_activity(id TEXT PRIMARY KEY, oldest TEXT NOT NULL, newest TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS icu_indoor_ftp(account TEXT PRIMARY KEY, watts REAL, observed_at TEXT, observed_day TEXT, status TEXT NOT NULL);
-        PRAGMA user_version=4;''')
+        PRAGMA user_version=5;''')
     def remember_indoor_ftp(self, account, watts, observed_at, observed_day, status):
         with self.db:
             self.db.execute('''INSERT INTO icu_indoor_ftp VALUES(?,?,?,?,?)
@@ -80,22 +86,44 @@ class Store:
     def indoor_ftp(self, account):
         row=self.db.execute('SELECT watts,observed_at,observed_day,status FROM icu_indoor_ftp WHERE account=?',(account,)).fetchone()
         return dict(zip(('watts','observed_at','observed_day','status'),row)) if row else None
-    def log_sync(self, oldest, newest, status):
+    def log_sync(self, oldest, newest, status, diagnostics=None, *, _commit=True):
         from datetime import timezone
-        with self.db:
-            self.db.execute('INSERT INTO sync_attempts(oldest,newest,attempted_at,status) VALUES(?,?,?,?)',(oldest,newest,datetime.now(timezone.utc).isoformat(),status))
+        with (self.db if _commit else nullcontext()):
+            cursor=self.db.execute('INSERT INTO sync_attempts(oldest,newest,attempted_at,status) VALUES(?,?,?,?)',(oldest,newest,datetime.now(timezone.utc).isoformat(),status))
+            if diagnostics:
+                self.db.execute('INSERT INTO sync_diagnostics VALUES(?,?)',(cursor.lastrowid,json.dumps(diagnostics,allow_nan=False)))
     def sync_history(self):
-        return [dict(zip(('oldest','newest','attempted_at','status'),r)) for r in self.db.execute('SELECT oldest,newest,attempted_at,status FROM sync_attempts ORDER BY id DESC LIMIT 20')]
-    def put_many(self,kind,records):
-        checked=[validate(r,kind) for r in records]
+        rows=self.db.execute('SELECT oldest,newest,attempted_at,status,payload FROM sync_attempts LEFT JOIN sync_diagnostics ON attempt_id=sync_attempts.id ORDER BY sync_attempts.id DESC LIMIT 20')
+        return [dict(zip(('oldest','newest','attempted_at','status'),r[:4]),**({'diagnostics':json.loads(r[4])} if r[4] else {})) for r in rows]
+    def save_icu_sync(self, oldest, newest, activities, wellness, status, diagnostics):
+        # Publish accepted data and its completeness record in one transaction.
+        # Network-level failure is handled before calling this method.
         with self.db:
+            n=self.put_many('activity',activities,_commit=False)
+            m=self.save_wellness(wellness,'icu',_commit=False)
+            self.db.executemany('DELETE FROM icu_rejected_activity WHERE id=?',((row['id'],) for row in activities))
+            self.db.executemany('''INSERT INTO icu_rejected_activity VALUES(?,?,?)
+                ON CONFLICT(id) DO UPDATE SET oldest=excluded.oldest,newest=excluded.newest''',
+                ((ident,oldest,newest) for ident in diagnostics['skipped_activity_ids']))
+            start,end=date.fromisoformat(oldest),date.fromisoformat(newest)
+            self.db.executemany('INSERT INTO icu_sync_day VALUES(?,?) ON CONFLICT(day) DO UPDATE SET status=excluded.status',
+                (((start+timedelta(days=i)).isoformat(),status) for i in range((end-start).days+1)))
+            self.log_sync(oldest,newest,status,diagnostics,_commit=False)
+        return n,m
+    def icu_sync_scope(self, oldest, newest):
+        by_day=dict(self.db.execute('SELECT day,status FROM icu_sync_day WHERE day BETWEEN ? AND ?',(oldest,newest)))
+        rejected={r[0] for r in self.db.execute('SELECT id FROM icu_rejected_activity WHERE oldest<=? AND newest>=?',(newest,oldest))}
+        return by_day,rejected
+    def put_many(self,kind,records,*,_commit=True):
+        checked=[validate(r,kind) for r in records]
+        with (self.db if _commit else nullcontext()):
             for r in checked:
                 key=r['id'] if kind=='activity' else r['date'] if kind=='wellness' else r['period_end']
                 self.db.execute('INSERT INTO records VALUES(?,?,?) ON CONFLICT(kind,key) DO UPDATE SET payload=excluded.payload',(kind,key,json.dumps(r,allow_nan=False)))
         return len(checked)
     def records(self,kind):
         return [json.loads(r[0]) for r in self.db.execute('SELECT payload FROM records WHERE kind=? ORDER BY key',(kind,))]
-    def save_wellness(self, records, source):
+    def save_wellness(self, records, source, *, _commit=True):
         """Keep normalized source snapshots; manual non-null values win conflicts.
 
         HRV value/type/device are selected together, never mixed across sources.
@@ -103,7 +131,7 @@ class Store:
         """
         if source not in ('manual','icu'): raise ValueError('unsupported source')
         checked=[validate(r,'wellness') for r in records]
-        with self.db:
+        with (self.db if _commit else nullcontext()):
             for row in checked:
                 day=row['date']
                 snapshots={r[0]:json.loads(r[1]) for r in self.db.execute('SELECT source,payload FROM wellness_sources WHERE day=?',(day,))}

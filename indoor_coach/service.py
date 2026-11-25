@@ -1,7 +1,7 @@
 """Agent callable JSON tools. Deliberately no external write tool."""
 from .store import Store, valid_date, number, validate
 from .analysis import analyze, recommend
-from .icu import ICUClient
+from .icu import ICUClient, recoverable_activity_id
 from .ftp import IndoorFTPResolver, error_details
 from .evidence import evidence_context, AGENT_WORKFLOW_PROMPT
 from .review import review_data
@@ -23,6 +23,21 @@ TOOLS = {
  'list_proposals':'Read local drafts. {} preserves legacy list; {limit?:20, after?:0, detail?:full|summary} enables bounded pagination.',
  'get_proposal':'Read one local draft by ID, filtered for provenance; {proposal_id, detail?:full|summary}',
 }
+
+def _validated_sync_rows(rows,kind):
+    """Keep valid siblings; never log raw bad records or validator messages."""
+    rejected=getattr(rows,'rejected_rows',[])
+    skipped=len(rejected)
+    ids={recoverable_activity_id(row.get('id')) for row in rejected} if kind=='activity' else set()
+    accepted=[]
+    for row in rows:
+        try:
+            accepted.append(validate(row,kind))
+        except (ValueError,TypeError,ArithmeticError,RecursionError):
+            skipped+=1
+            if kind=='activity' and isinstance(row,dict):
+                ids.add(recoverable_activity_id(row.get('id')))
+    return accepted,skipped,sorted(i for i in ids if i is not None)
 
 class Service:
     def __init__(self,db_path):
@@ -58,20 +73,26 @@ class Service:
         if name=='import_baseline': return {'stored':self.store.put_many('baseline',[args['record']])}
         if name=='sync_icu':
             valid_date(args.get('oldest')); valid_date(args.get('newest'))
+            span=(date.fromisoformat(args['newest'])-date.fromisoformat(args['oldest'])).days
+            if not 0 <= span <= 366: raise ValueError('invalid date range')
             try:
                 client=ICUClient.from_env()
                 activities=client.activities(args['oldest'],args['newest'])
                 wellness=client.wellness(args['oldest'],args['newest'])
-                for row in activities: validate(row,'activity')
-                for row in wellness: validate(row,'wellness')
-                activity_count=self.store.put_many('activity',activities)
-                wellness_count=self.store.save_wellness(wellness,'icu')
+                activities,n,skipped_ids=_validated_sync_rows(activities,'activity')
+                wellness,m,_=_validated_sync_rows(wellness,'wellness')
+                hr_flags=[r.get('heart_rate_quality') for r in activities if r.get('source_status')=='independent']
+                diagnostics={'activities_skipped':n,'wellness_skipped':m,'skipped_activity_ids':skipped_ids,
+                             'heart_rate_missing_zero':hr_flags.count('missing_zero'),'heart_rate_invalid':hr_flags.count('invalid')}
+                status='partial' if n or m else 'success'
+                activity_count,wellness_count=self.store.save_icu_sync(args['oldest'],args['newest'],activities,wellness,status,diagnostics)
             except Exception:
                 self.store.log_sync(args['oldest'],args['newest'],'failed')
                 raise
-            self.store.log_sync(args['oldest'],args['newest'],'success')
             conflicts=[r for r in self.store.wellness_provenance() if args['oldest'] <= r['date'] <= args['newest'] and r['conflict_fields']]
-            return {'activities_stored':activity_count,'wellness_stored':wellness_count,'conflicts':conflicts,'merge_policy':'manual_non_null_priority; HRV group kept together','external_write_enabled':False}
+            return {'status':status,'activities_stored':activity_count,'wellness_stored':wellness_count,
+                    **{k:v for k,v in diagnostics.items() if k!='skipped_activity_ids'},
+                    'conflicts':conflicts,'merge_policy':'manual_non_null_priority; HRV group kept together','external_write_enabled':False}
         if name=='get_proposal':
             proposal=self.store.get_proposal(args.get('proposal_id'))
             if proposal is None: raise ValueError('proposal not found')
@@ -110,15 +131,28 @@ class Service:
         wellness=self.store.records('wellness')
         baselines=[b for b in self.store.records('baseline') if b['period_end']<args['as_of']]
         baseline=baselines[-1] if baselines else None
-        result=analyze(activities,wellness,baseline,args['as_of'],ftp)
+        start=(date.fromisoformat(args['as_of'])-timedelta(days=history_days-1)).isoformat()
+        load_start=(date.fromisoformat(args['as_of'])-timedelta(days=6)).isoformat()
+        sync_attempts=self.store.sync_history()
+        day_coverage,quarantined=self.store.icu_sync_scope(start,args['as_of'])
+        evidence=evidence_context(activities,args['as_of'],target_id,history_days,sync_attempts,
+                                  day_coverage=day_coverage,quarantined_ids=quarantined)
+        access=evidence['data_access']
+        rejected=set(access.pop('rejected_target_ids',[])) | quarantined
+        entries=[r for r in activities if r['id'] not in rejected]
+        result=analyze(entries,wellness,baseline,args['as_of'],ftp)
+        quarantined_load=any(r['id'] in rejected and load_start <= r['date'] <= args['as_of'] for r in activities)
+        if access.get('load_window_partial') or quarantined_load:
+            result['load']['tss_complete']=False
+            result['load']['incomplete_due_to_partial_sync']=True
+            result['warnings'].append('Partial ICU sync or quarantined cached activities make this load incomplete; known-only estimates are not total load.')
         result['ftp_basis']=ftp_basis
         provenance=[r for r in self.store.wellness_provenance() if result['reference_window']['start'] <= r['date'] <= args['as_of']]
         result['wellness_provenance']=provenance
-        evidence=evidence_context(activities,args['as_of'],target_id,history_days,self.store.sync_history())
         if sync_error:
-            evidence['data_access']['refresh_error']=sync_error
+            access['refresh_error']=sync_error
         result['data_review']=review_data(result,evidence,[r for r in provenance if r['conflict_fields']])
-        snapshot={'as_of':args['as_of'],'ftp':{k:v for k,v in ftp_basis.items() if k not in ('source','refresh_error')},'activities':activities,'wellness':wellness,'baseline':baseline,'provenance':provenance,'sync':self.store.sync_history(),'target_id':target_id,'history_days':history_days}
+        snapshot={'as_of':args['as_of'],'ftp':{k:v for k,v in ftp_basis.items() if k not in ('source','refresh_error')},'activities':entries,'wellness':wellness,'baseline':baseline,'provenance':provenance,'sync':sync_attempts,'sync_days':day_coverage,'quarantined':sorted(rejected),'target_id':target_id,'history_days':history_days}
         result['data_review']['snapshot_id']=hashlib.sha256(json.dumps(snapshot,sort_keys=True,allow_nan=False).encode()).hexdigest()
         result['agent_workflow']=AGENT_WORKFLOW_PROMPT
         if name in ('analyze','prepare_analysis'): return result

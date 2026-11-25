@@ -71,3 +71,77 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn('Do not repeat questions',AGENT_WORKFLOW_PROMPT)
 
 if __name__=='__main__': unittest.main()
+
+class PartialSyncEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def attempt(status='partial', oldest='2040-10-19', newest='2040-11-15', hour='12', ids=('target',)):
+        return {'status':status,'oldest':oldest,'newest':newest,'attempted_at':f'2040-11-15T{hour}:00:00Z',
+                'diagnostics':{'activities_skipped':len(ids),'wellness_skipped':1,'heart_rate_missing_zero':2,
+                               'skipped_activity_ids':list(ids), 'raw_values':'private', 'api_key':'secret'}}
+    def test_exact_target_is_not_substituted_with_cache_or_other_ride(self):
+        rows=[ride(),ride(id='different',date='2040-11-14')]
+        result=evidence_context(rows,'2040-11-15',target_id='target',sync_attempts=[self.attempt()])
+        self.assertIsNone(result['target'])
+        self.assertTrue(result['target_selection']['rejected_by_partial_sync'])
+        self.assertIn('requested_target_rejected_by_partial_sync',result['missing_evidence'])
+        self.assertEqual(result['data_access']['rejected_target_ids'],['target'])
+        self.assertNotIn('private',str(result))
+        self.assertNotIn('secret',str(result))
+    def test_latest_partial_does_not_allow_stale_full_success_claim(self):
+        result=evidence_context([ride()],'2040-11-15',sync_attempts=[
+            self.attempt(),self.attempt('success',hour='11',ids=())])
+        access=result['data_access']
+        self.assertFalse(access['successful_full_window_query_evidenced'])
+        self.assertTrue(access['partial_coverage'])
+        self.assertTrue(access['load_window_partial'])
+        self.assertEqual(access['latest_relevant_attempt']['status'],'partial')
+    def test_later_narrow_success_does_not_repair_other_days(self):
+        rows=[ride(date='2040-11-13'),ride(id='other')]
+        result=evidence_context(rows,'2040-11-15',target_id='target',sync_attempts=[
+            self.attempt('success','2040-11-15','2040-11-15','13',()),self.attempt()])
+        access=result['data_access']
+        self.assertEqual(access['latest_relevant_attempt']['status'],'success')
+        self.assertTrue(access['load_window_partial'])
+        self.assertEqual(access['unrepaired_partial_day_count'],27)
+        self.assertEqual(access['latest_unrepaired_partial_attempt']['diagnostics']['activities_skipped'],1)
+        self.assertIsNone(result['target'])
+    def test_later_covering_success_repairs_same_id(self):
+        result=evidence_context([ride()],'2040-11-15',target_id='target',sync_attempts=[
+            self.attempt('success',hour='13',ids=()),self.attempt()])
+        self.assertEqual(result['target']['id'],'target')
+        self.assertFalse(result['target_selection']['rejected_by_partial_sync'])
+        self.assertFalse(result['data_access']['partial_coverage'])
+    def test_old_partial_outside_load_window_does_not_mark_load_incomplete(self):
+        result=evidence_context([ride()],'2040-11-15',sync_attempts=[
+            self.attempt(oldest='2040-11-01',newest='2040-11-02',ids=())])
+        self.assertTrue(result['data_access']['partial_coverage'])
+        self.assertFalse(result['data_access']['load_window_partial'])
+    def test_review_and_summary_preserve_partial_and_gate_exact_target(self):
+        from indoor_coach.review import review_data
+        from indoor_coach.projection import review_summary
+        data=evidence_context([ride()],'2040-11-15',target_id='target',sync_attempts=[self.attempt()])
+        review=review_data({'activities':[{'id':'different'}],'load':{'tss_complete':False},'ftp_w':220},data,[])
+        self.assertEqual(review['recommendation_permission'],'needs_data')
+        self.assertIn('latest_refresh_partial',[i['code'] for i in review['issues']])
+        small=review_summary(review)
+        access=small['evidence']['data_access']
+        self.assertEqual(access['latest_relevant_attempt']['diagnostics']['activities_skipped'],1)
+        self.assertTrue(access['load_window_partial'])
+        self.assertNotIn('skipped_activity_ids',str(small))
+        self.assertNotIn('rejected_target_ids',access)
+
+    def test_persisted_quarantine_survives_empty_success_and_bounded_history(self):
+        result=evidence_context([ride()],'2040-11-15',target_id='target',
+                                sync_attempts=[self.attempt('success',ids=())],
+                                quarantined_ids={'target'},day_coverage={'2040-11-15':'success'})
+        self.assertIsNone(result['target'])
+        self.assertTrue(result['data_access']['load_window_partial'])
+        self.assertFalse(result['data_access']['partial_coverage'])
+        self.assertFalse(result['data_access']['successful_full_window_query_evidenced'])
+        self.assertTrue(result['target_selection']['rejected_by_partial_sync'])
+
+    def test_persisted_coverage_reports_partial_after_history_pruned(self):
+        result=evidence_context([ride()],'2040-11-15',day_coverage={'2040-11-13':'partial'})
+        self.assertTrue(result['data_access']['partial_coverage'])
+        self.assertTrue(result['data_access']['load_window_partial'])
+        self.assertIn('icu_refresh_partial_unrepaired',result['missing_evidence'])

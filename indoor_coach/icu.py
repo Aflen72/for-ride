@@ -34,6 +34,36 @@ class ICUError(RuntimeError):
 
 
 
+class ICURows(list):
+    """List-compatible normalized response with sanitized row-level rejections."""
+
+    def __init__(self):
+        super().__init__()
+        self.rejected_rows = []
+
+
+def recoverable_activity_id(value):
+    """Recover only an ICU numeric identifier; never echo arbitrary rejected data."""
+    if type(value) is int and 0 < value < 10**20:
+        return str(value)
+    if isinstance(value, str) and re.fullmatch(r"i?[0-9]{1,20}", value) and any(
+        digit != "0" for digit in value.removeprefix("i")
+    ):
+        return value
+    return None
+
+
+def _activity_heart_rate(value):
+    if value is None:
+        return None, None
+    if type(value) in (int, float):
+        if value == 0:
+            return None, "missing_zero"
+        if 25 <= value <= 250:
+            return value, None
+    return None, "invalid"
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Do not forward authorization, even to another HTTPS destination.
@@ -95,21 +125,29 @@ def normalize_activity(record):
     duration = _number(record.get("moving_time"))
     if duration is None:
         duration = _number(record.get("elapsed_time"))
+    activity_id = record.get("id")
+    if type(activity_id) is int:
+        activity_id = recoverable_activity_id(activity_id)
+    if not isinstance(activity_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}", activity_id):
+        activity_id = None
+    hr, hr_quality = _activity_heart_rate(record.get("average_heartrate"))
     result = {
-        "id": str(record["id"]) if record.get("id") is not None else None,
+        "id": activity_id,
         "date": _record_date(record, "start_date_local", "start_date", "date"),
         "sport": kind,
         "indoor": indoor,
         "duration_s": duration,
         "avg_power_w": _number(record.get("icu_average_watts", record.get("average_watts"))),
         "normalized_power_w": _number(record.get("icu_weighted_avg_watts")),
-        "avg_hr_bpm": _number(record.get("average_heartrate")),
+        "avg_hr_bpm": hr,
         "source": source,
         "restricted": restricted,
         "source_status": status,
         "hr_zone_upper_bpm": _zone_list(record.get("icu_hr_zones"), boundaries=True),
         "hr_zone_time_s": _zone_list(record.get("icu_hr_zone_times")),
     }
+    if hr_quality is not None:
+        result['heart_rate_quality'] = hr_quality
     if result['hr_zone_upper_bpm'] is not None and result['hr_zone_time_s'] is not None and len(result['hr_zone_upper_bpm']) != len(result['hr_zone_time_s']):
         result['hr_zone_time_s'] = None
     if restricted:
@@ -120,7 +158,7 @@ def normalize_activity(record):
             result["withheld_reason"] += " Metadata-only activity."
     elif kind is None and duration is None:
         result["withheld_reason"] = "Metadata-only activity: source and training metrics unavailable; not evidence of no training."
-    result["available_fields"] = [key for key, value in result.items() if value is not None and key not in ("available_fields", "withheld_reason")]
+    result["available_fields"] = [key for key, value in result.items() if value is not None and key not in ("available_fields", "withheld_reason", "heart_rate_quality")]
     return result
 
 
@@ -226,7 +264,7 @@ class ICUClient:
             raise ValueError("Unsupported endpoint")
         query = urllib.parse.urlencode({"oldest": oldest, "newest": newest})
         parsed = self._request_json("GET", f"/{endpoint}?{query}", stage=endpoint, endpoint=endpoint)
-        if not isinstance(parsed, list) or any(not isinstance(row, dict) for row in parsed):
+        if not isinstance(parsed, list):
             raise ICUError("Intervals.icu returned an unexpected data shape", stage=endpoint,
                            endpoint=endpoint, reason="unexpected_shape")
         return parsed
@@ -280,8 +318,35 @@ class ICUClient:
                 "power_zones": _zone_list(data.get("power_zones"), boundaries=True),
                 "hr_zones": _zone_list(data.get("hr_zones"), boundaries=True)}
 
+    @staticmethod
+    def _normalize_rows(raw_rows, normalizer, *, activities=False):
+        normalized = ICURows()
+        for index, raw in enumerate(raw_rows):
+            problem = {"index": index}
+            if not isinstance(raw, dict):
+                problem["reason"] = "non_object"
+            else:
+                if activities:
+                    ident = recoverable_activity_id(raw.get("id"))
+                    if ident is not None:
+                        problem["id"] = ident
+                try:
+                    row = normalizer(raw)
+                except (TypeError, ValueError, ArithmeticError, RecursionError):
+                    problem["reason"] = "normalization_failed"
+                else:
+                    if activities and row.get("id") is None:
+                        problem["reason"] = "invalid_id"
+                    elif row.get("date") is None:
+                        problem["reason"] = "invalid_date"
+                    else:
+                        normalized.append(row)
+                        continue
+            normalized.rejected_rows.append(problem)
+        return normalized
+
     def activities(self, oldest: str, newest: str):
-        return [normalize_activity(row) for row in self._get("activities", oldest, newest)]
+        return self._normalize_rows(self._get("activities", oldest, newest), normalize_activity, activities=True)
 
     def wellness(self, oldest: str, newest: str):
-        return [normalize_wellness(row) for row in self._get("wellness", oldest, newest)]
+        return self._normalize_rows(self._get("wellness", oldest, newest), normalize_wellness)

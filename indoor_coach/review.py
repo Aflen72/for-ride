@@ -13,7 +13,18 @@ def review_data(analysis, evidence, conflicts):
     if not load.get('tss_complete'): issue('load_incomplete',load.get('estimated_tss_known_only'),'Describe known-only estimates, not complete fatigue load.')
     for gap in evidence.get('missing_evidence',[]):
         issue('evidence_gap',gap,'Narrow the conclusion; follow next_checks before asking the user to repeat available data.')
-    latest=evidence.get('data_access',{}).get('latest_relevant_attempt')
+    access=evidence.get('data_access', {})
+    latest=access.get('latest_relevant_attempt')
+    target_rejected=evidence.get('target_selection', {}).get('rejected_by_partial_sync', False)
+    if access.get('partial_coverage') or access.get('rejected_target_ids'):
+        issue('latest_refresh_partial' if latest and latest['status']=='partial' else 'unrepaired_partial_refresh',
+              {'unrepaired_partial_day_count':access.get('unrepaired_partial_day_count'),
+               'load_window_partial':access.get('load_window_partial'),
+               'diagnostics':{k:v for k,v in (access.get('latest_unrepaired_partial_attempt') or {}).get('diagnostics',{}).items() if k!='skipped_activity_ids'}},
+              'Use only accepted evidence and disclose skipped data. A narrower later query does not repair unchecked days.')
+    if target_rejected:
+        issue('requested_target_rejected_by_partial_sync', None,
+              'Do not substitute cached or different activity data for the requested rejected record.')
     if latest and latest['status'] in ('failed','error','not_configured'):
         issue('latest_refresh_not_successful',latest,'Use cached evidence transparently; do not claim latest records were verified.')
     usable=[]
@@ -24,7 +35,7 @@ def review_data(analysis, evidence, conflicts):
         elif d['current'] is not None:
             (descriptive if key in ('deep_sleep_pct','light_sleep_pct') else usable).append(key)
     if conflicts: issue('source_conflicts',[{'date':r['date'],'fields':r['conflict_fields']} for r in conflicts],'Disclose conflicting sources and priority; do not call either independently verified.')
-    if not analysis.get('activities'):
+    if not analysis.get('activities') or target_rejected:
         status,permission='insufficient','needs_data'
     elif issues:
         status,permission='limited','provisional_template_only'

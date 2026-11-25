@@ -139,6 +139,8 @@ def analyze(activities, wellness, baseline=None, as_of=None, ftp=None):
         valid_load = duration is not None and duration > 0 and np is not None and np > 0 and ftp is not None
         intensity = np / ftp if valid_load else None
         summaries.append({"id": a.get("id"), "date": d.isoformat(), "duration_minutes": duration / 60 if duration is not None and duration >= 0 else None, "avg_power_w": _number(a.get("avg_power_w")), "normalized_power_w": np, "avg_hr_bpm": _number(a.get("avg_hr_bpm")), "intensity_factor": round(intensity, 3) if intensity is not None else None, "estimated_tss": round(duration / 3600 * intensity ** 2 * 100, 1) if valid_load else None, "source": a.get("source")})
+        if a.get("heart_rate_quality") in ("missing_zero", "invalid"):
+            summaries[-1]["heart_rate_quality"] = a["heart_rate_quality"]
     if restricted:
         warnings.append("Restricted activities exist: missing metrics are not zero load. Obtain an authorized original export if needed; do not bypass source restrictions.")
     if unknown_source:

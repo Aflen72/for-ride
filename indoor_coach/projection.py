@@ -26,12 +26,19 @@ def review_summary(review):
     evidence=review.get('evidence_workflow', {})
     comparison=evidence.get('comparison', {})
     access=evidence.get('data_access', {})
+    compact_access={k:v for k,v in access.items() if k not in ('sync_attempts','rejected_target_ids')}
+    for key in ('latest_relevant_attempt','latest_load_window_attempt','latest_unrepaired_partial_attempt'):
+        attempt=compact_access.get(key)
+        if attempt and 'diagnostics' in attempt:
+            compact_access[key]={**attempt, 'diagnostics':{k:v for k,v in attempt['diagnostics'].items() if k!='skipped_activity_ids'}}
+    if 'rejected_target_ids' in access:
+        compact_access['rejected_target_count']=len(access['rejected_target_ids'])
     return {
         **{k:review[k] for k in ('status','not_a_health_score','recommendation_permission','snapshot_id','scope') if k in review},
         'issues':[{'code':x.get('code'),'evidence':x.get('evidence')} for x in review.get('issues',[])],
         'usable_reference_metrics':review.get('usable_reference_metrics',[]),
         'evidence':{**{k:evidence[k] for k in ('window','target_selection','target','heart_rate_evidence','excluded_counts','missing_evidence','next_checks','unsupported_claims','capabilities') if k in evidence},
-                    'data_access':{k:v for k,v in access.items() if k != 'sync_attempts'},
+                    'data_access':compact_access,
                     'comparison':{'criteria':comparison.get('criteria'),'count':comparison.get('count',0),
                                   'sample_records':comparison.get('records',[])[:5],
                                   'records_truncated':len(comparison.get('records',[]))>5}},
